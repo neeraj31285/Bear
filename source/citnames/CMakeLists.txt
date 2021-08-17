@@ -73,7 +73,7 @@ install(FILES man/citnames.1
 if (ENABLE_UNIT_TESTS)
     add_executable(citnames_unit_test
             test/OutputTest.cc
-            test/ToolTest.cc
+            test/ToolClangTest.cc
             test/ToolGccTest.cc
             test/ToolWrapperTest.cc
             )

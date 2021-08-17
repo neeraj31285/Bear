@@ -32,7 +32,105 @@ using namespace cs::semantic;
 
 namespace {
 
-    const FlagsByName FLAG_DEFINITION = {
+    // https://gcc.gnu.org/onlinedocs/cpp/Environment-Variables.html
+    Arguments flags_from_environment(const std::map<std::string, std::string> &environment) {
+        Arguments flags;
+        // define util function to append the content of a defined variable
+        const auto inserter = [&flags](const std::string& value, const std::string& flag) {
+            // the variable value is a colon separated directory list
+            for (const auto& path : sys::path::split(value)) {
+                // If the expression was ":/opt/thing", that will split into two
+                // entries. One which is an empty string and the path. Empty string
+                // refers the current working directory.
+                auto directory = (path.empty()) ? "." : path.string();
+                flags.push_back(flag);
+                flags.push_back(directory);
+            }
+        };
+        // check the environment for preprocessor influencing variables
+        for (auto env : { "CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH" }) {
+            if (auto it = environment.find(env); it != environment.end()) {
+                inserter(it->second, "-I");
+            }
+        }
+        if (auto it = environment.find("OBJC_INCLUDE_PATH"); it != environment.end()) {
+            inserter(it->second, "-isystem");
+        }
+
+        return flags;
+    }
+
+    bool is_compiler_query(const CompilerFlags& flags)
+    {
+        // no flag is a no compilation
+        if (flags.empty()) {
+            return true;
+        }
+        // otherwise check if this was a version query of a help
+        return std::any_of(flags.begin(), flags.end(), [](const auto& flag) {
+            return (flag.type == CompilerFlagType::KIND_OF_OUTPUT_INFO);
+        });
+    }
+
+    bool is_prerpocessor(const CompilerFlags& flags)
+    {
+        // one of those make dependency generation also not count as compilation.
+        // (will cause duplicate element, which is hard to detect.)
+        static const std::set<std::string_view> NO_COMPILATION_FLAG =
+                { "-M", "-MM" };
+
+        return std::any_of(flags.begin(), flags.end(), [](const auto &flag) {
+            const std::string &candidate = flag.arguments.front();
+            return ((flag.type == CompilerFlagType::KIND_OF_OUTPUT_NO_LINKING) && (candidate == "-E"))
+                || ((flag.type == CompilerFlagType::PREPROCESSOR_MAKE) && (NO_COMPILATION_FLAG.find(candidate) != NO_COMPILATION_FLAG.end()));
+        });
+    }
+
+    bool linking(const CompilerFlags& flags)
+    {
+        return std::none_of(flags.begin(), flags.end(), [](auto flag) {
+            return (flag.type == CompilerFlagType::KIND_OF_OUTPUT_NO_LINKING);
+        });
+    }
+
+    std::tuple<
+            Arguments,
+            std::vector<fs::path>,
+            std::optional<fs::path>
+    > split(const CompilerFlags &flags) {
+        Arguments arguments;
+        std::vector<fs::path> sources;
+        std::optional<fs::path> output;
+
+        for (const auto& flag : flags) {
+            switch (flag.type) {
+                case CompilerFlagType::SOURCE: {
+                    auto candidate = fs::path(flag.arguments.front());
+                    sources.emplace_back(std::move(candidate));
+                    break;
+                }
+                case CompilerFlagType::KIND_OF_OUTPUT_OUTPUT: {
+                    auto candidate = fs::path(flag.arguments.back());
+                    output = std::make_optional(std::move(candidate));
+                    break;
+                }
+                case CompilerFlagType::LINKER:
+                case CompilerFlagType::PREPROCESSOR_MAKE:
+                case CompilerFlagType::DIRECTORY_SEARCH_LINKER:
+                    break;
+                default: {
+                    std::copy(flag.arguments.begin(), flag.arguments.end(), std::back_inserter(arguments));
+                    break;
+                }
+            }
+        }
+        return std::make_tuple(arguments, sources, output);
+    }
+}
+
+namespace cs::semantic {
+
+    const FlagsByName ToolGcc::FLAG_DEFINITION = {
             {"-x",                 {Instruction(1, Match::EXACT, false),   CompilerFlagType::KIND_OF_OUTPUT}},
             {"-c",                 {Instruction(0, Match::EXACT, false), CompilerFlagType::KIND_OF_OUTPUT_NO_LINKING}},
             {"-S",                 {Instruction(0, Match::EXACT, false), CompilerFlagType::KIND_OF_OUTPUT_NO_LINKING}},
@@ -136,126 +234,14 @@ namespace {
             {"--",                 {Instruction(0, Match::PARTIAL, false), CompilerFlagType::OTHER}},
     };
 
-    rust::Result<CompilerFlags> parse_flags(const Execution &execution)
-    {
-        static auto const parser =
-                Repeat(
-                        OneOf(
-                                FlagParser(FLAG_DEFINITION),
-                                SourceMatcher(),
-                                EverythingElseFlagMatcher()
-                        )
-                );
-
-        return parse(parser, execution);
-    }
-
-    // https://gcc.gnu.org/onlinedocs/cpp/Environment-Variables.html
-    Arguments flags_from_environment(const std::map<std::string, std::string> &environment) {
-        Arguments flags;
-        // define util function to append the content of a defined variable
-        const auto inserter = [&flags](const std::string& value, const std::string& flag) {
-            // the variable value is a colon separated directory list
-            for (const auto& path : sys::path::split(value)) {
-                // If the expression was ":/opt/thing", that will split into two
-                // entries. One which is an empty string and the path. Empty string
-                // refers the current working directory.
-                auto directory = (path.empty()) ? "." : path.string();
-                flags.push_back(flag);
-                flags.push_back(directory);
-            }
-        };
-        // check the environment for preprocessor influencing variables
-        for (auto env : { "CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH" }) {
-            if (auto it = environment.find(env); it != environment.end()) {
-                inserter(it->second, "-I");
-            }
-        }
-        if (auto it = environment.find("OBJC_INCLUDE_PATH"); it != environment.end()) {
-            inserter(it->second, "-isystem");
-        }
-
-        return flags;
-    }
-
-    bool is_compiler_query(const CompilerFlags& flags)
-    {
-        // no flag is a no compilation
-        if (flags.empty()) {
-            return true;
-        }
-        // otherwise check if this was a version query of a help
-        return std::any_of(flags.begin(), flags.end(), [](const auto& flag) {
-            return (flag.type == CompilerFlagType::KIND_OF_OUTPUT_INFO);
-        });
-    }
-
-    bool is_prerpocessor(const CompilerFlags& flags)
-    {
-        // one of those make dependency generation also not count as compilation.
-        // (will cause duplicate element, which is hard to detect.)
-        static const std::set<std::string_view> NO_COMPILATION_FLAG =
-                { "-M", "-MM" };
-
-        return std::any_of(flags.begin(), flags.end(), [](const auto &flag) {
-            const std::string &candidate = flag.arguments.front();
-            return ((flag.type == CompilerFlagType::KIND_OF_OUTPUT_NO_LINKING) && (candidate == "-E"))
-                || ((flag.type == CompilerFlagType::PREPROCESSOR_MAKE) && (NO_COMPILATION_FLAG.find(candidate) != NO_COMPILATION_FLAG.end()));
-        });
-    }
-
-    bool linking(const CompilerFlags& flags)
-    {
-        return std::none_of(flags.begin(), flags.end(), [](auto flag) {
-            return (flag.type == CompilerFlagType::KIND_OF_OUTPUT_NO_LINKING);
-        });
-    }
-
-    std::tuple<
-            Arguments,
-            std::vector<fs::path>,
-            std::optional<fs::path>
-    > split(const CompilerFlags &flags) {
-        Arguments arguments;
-        std::vector<fs::path> sources;
-        std::optional<fs::path> output;
-
-        for (const auto& flag : flags) {
-            switch (flag.type) {
-                case CompilerFlagType::SOURCE: {
-                    auto candidate = fs::path(flag.arguments.front());
-                    sources.emplace_back(std::move(candidate));
-                    break;
-                }
-                case CompilerFlagType::KIND_OF_OUTPUT_OUTPUT: {
-                    auto candidate = fs::path(flag.arguments.back());
-                    output = std::make_optional(std::move(candidate));
-                    break;
-                }
-                case CompilerFlagType::LINKER:
-                case CompilerFlagType::PREPROCESSOR_MAKE:
-                case CompilerFlagType::DIRECTORY_SEARCH_LINKER:
-                    break;
-                default: {
-                    std::copy(flag.arguments.begin(), flag.arguments.end(), std::back_inserter(arguments));
-                    break;
-                }
-            }
-        }
-        return std::make_tuple(arguments, sources, output);
-    }
-}
-
-namespace cs::semantic {
-
     rust::Result<SemanticPtr> ToolGcc::recognize(const Execution &execution) const {
-        if (recognize(execution.executable)) {
+        if (is_compiler_call(execution.executable)) {
             return compilation(execution);
         }
         return rust::Ok(SemanticPtr());
     }
 
-    bool ToolGcc::recognize(const fs::path& program) const {
+    bool ToolGcc::is_compiler_call(const fs::path& program) const {
         static const auto pattern = std::regex(
                 // - cc
                 // - c++
@@ -272,7 +258,20 @@ namespace cs::semantic {
     }
 
     rust::Result<SemanticPtr> ToolGcc::compilation(const Execution &execution) const {
-        return parse_flags(execution)
+        return compilation(FLAG_DEFINITION, execution);
+    }
+
+    rust::Result<SemanticPtr> ToolGcc::compilation(const FlagsByName &flags, const Execution &execution) {
+        auto const parser =
+                Repeat(
+                        OneOf(
+                                FlagParser(flags),
+                                SourceMatcher(),
+                                EverythingElseFlagMatcher()
+                        )
+                );
+
+        return parse(parser, execution)
                 .and_then<SemanticPtr>([&execution](auto flags) -> rust::Result<SemanticPtr> {
                     if (is_compiler_query(flags)) {
                         SemanticPtr result = std::make_shared<QueryCompiler>();
